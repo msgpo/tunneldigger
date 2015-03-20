@@ -7,7 +7,15 @@ recent Linux kernels.
 
 .. _wlan slovenija: https://wlan-si.net
 
-This is the sudo mesh fork. It has only the following changes:
+This is a fairly historical version of the sudo mesh fork. 
+We basically scrapped most of the sudomesh specific code so that we could
+stay relevant with the upstream repo. I'm keeping this as the soiled_master
+branch in case we need to revisit this history.
+
+With that in mind.....
+
+
+It has only the following changes:
 
 - Added init.d file for broker
 - Fixed requirements.txt file
