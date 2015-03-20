@@ -21,3 +21,9 @@ discuss the project, use `development mailing list`_.
 .. _open a new one: https://dev.wlan-si.net/newticket
 .. _GitHub: https://github.com/wlanslovenija/tunneldigger
 .. _development mailing list: https://wlan-si.net/lists/info/development
+
+or sudo mesh wiki and development list:
+
+.. _sudo mesh wiki: https://sudoroom.org/wiki/Mesh
+.. _sudo mesh mailing list: http://lists.sudoroom.org/listinfo/mesh
+
