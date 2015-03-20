@@ -27,3 +27,6 @@ or sudo mesh wiki and development list:
 .. _sudo mesh wiki: https://sudoroom.org/wiki/Mesh
 .. _sudo mesh mailing list: http://lists.sudoroom.org/listinfo/mesh
 
+*If you're confused about why you can't pull a fresh version of the sudomesh fork, it's because I (maxb) 
+re-wrote a bunch of history on the master branch. I apologize and it's pretty much entirely my fault, but 
+it was inevitable. Go ahead and pull a clean version of this repo and it let's all cross our fingers it works!*
