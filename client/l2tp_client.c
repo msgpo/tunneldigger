@@ -49,6 +49,9 @@
 
 #include "asyncns.h"
 
+// Maximum number of unacknowledged reliable messages.
+#define MAX_PENDING_MESSAGES 30
+
 // If this is not defined, build fails on OpenWrt
 #define IP_PMTUDISC_PROBE 3
 
@@ -171,9 +174,11 @@ typedef struct {
   time_t timer_tunnel;
   time_t timer_keepalive;
   time_t timer_reinit;
+  time_t timer_resolving;
 } l2tp_context;
 
 // Forward declarations
+void context_delete_tunnel(l2tp_context *ctx);
 void context_close_tunnel(l2tp_context *ctx);
 void context_send_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t len);
 void context_send_raw_packet(l2tp_context *ctx, char *packet, uint8_t len);
@@ -359,6 +364,7 @@ int context_reinitialize(l2tp_context *ctx)
   ctx->timer_tunnel = now;
   ctx->timer_keepalive = now;
   ctx->timer_reinit = now;
+  ctx->timer_resolving = -1;
 
   // PMTU discovery
   ctx->pmtu = 0;
@@ -369,6 +375,9 @@ int context_reinitialize(l2tp_context *ctx)
   ctx->timer_pmtu_xmit = -1;
 
   ctx->state = STATE_RESOLVING;
+
+  // Ensure any tunnels are removed.
+  context_delete_tunnel(ctx);
 
   return 0;
 }
@@ -383,6 +392,7 @@ void context_start_connect(l2tp_context *ctx)
   ctx->broker_reshints.ai_socktype = SOCK_DGRAM;
   ctx->broker_resq = asyncns_getaddrinfo(asyncns_context, ctx->broker_hostname, ctx->broker_port,
     &ctx->broker_reshints);
+  ctx->timer_resolving = timer_now();
 
   if (!ctx->broker_resq) {
     syslog(LOG_ERR, "Failed to start name resolution!");
@@ -571,17 +581,26 @@ void context_send_reliable_packet(l2tp_context *ctx, uint8_t type, char *payload
   msg->len = L2TP_CONTROL_SIZE + len + 2;
   msg->next = NULL;
 
+  size_t pending_messages = 0;
   if (ctx->reliable_unacked == NULL) {
     ctx->reliable_unacked = msg;
   } else {
     reliable_message *m = ctx->reliable_unacked;
-    while (m->next != NULL)
+    while (m->next != NULL) {
       m = m->next;
+      pending_messages++;
+    }
 
     m->next = msg;
   }
 
-  // TODO If there are too many unacked messages, start dropping new ones
+  // If there are too many unacked messages, start dropping old ones.
+  if (pending_messages > MAX_PENDING_MESSAGES) {
+    reliable_message *m = ctx->reliable_unacked;
+    ctx->reliable_unacked = m->next;
+    free(m->msg);
+    free(m);
+  }
 
   ctx->reliable_seqno++;
   context_send_raw_packet(ctx, msg->msg, msg->len);
@@ -590,7 +609,20 @@ void context_send_reliable_packet(l2tp_context *ctx, uint8_t type, char *payload
 void context_send_raw_packet(l2tp_context *ctx, char *packet, uint8_t len)
 {
   if (send(ctx->fd, packet, len, 0) < 0) {
-    syslog(LOG_WARNING, "Failed to send() in raw packet (errno=%d, type=%x)!", errno, packet[OFFSET_CONTROL_TYPE]);
+    switch (errno) {
+      case EINVAL: {
+        // This may happen when the underlying interface is removed. In this case we
+        // need to bind the socket again and re-initialize the context.
+        syslog(LOG_WARNING, "Failed to send() control packet, interface disappeared?");
+        syslog(LOG_WARNING, "Forcing tunnel reinitialization.");
+        ctx->state = STATE_REINIT;
+        break;
+      }
+      default: {
+        syslog(LOG_WARNING, "Failed to send() control packet (errno=%d, type=%x)!", errno, packet[OFFSET_CONTROL_TYPE]);
+        break;
+      }
+    }
   }
 }
 
@@ -605,9 +637,7 @@ void context_send_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t
     len += 12 - L2TP_CONTROL_SIZE - len;
 
   // Send the packet
-  if (send(ctx->fd, &buffer, L2TP_CONTROL_SIZE + len, 0) < 0) {
-    syslog(LOG_WARNING, "Failed to send() in send packet (errno=%d, type=%x)!", errno, type);
-  }
+  context_send_raw_packet(ctx, (char*) &buffer, L2TP_CONTROL_SIZE + len);
 }
 
 void context_send_pmtu_probe(l2tp_context *ctx, size_t size)
@@ -632,11 +662,11 @@ void context_send_pmtu_probe(l2tp_context *ctx, size_t size)
 void context_pmtu_start_discovery(l2tp_context *ctx)
 {
   size_t sizes[] = {
-    750, 1000, 1100, 1280, 1334, 1400, 1450, 1476, 1492, 1500
+    1334, 1400, 1450, 1476, 1492, 1500
   };
 
   int i;
-  for (i = 0; i < 9; i++) {
+  for (i = 0; i < 6; i++) {
     context_send_pmtu_probe(ctx, sizes[i]);
   }
 }
@@ -668,6 +698,17 @@ void context_send_setup_request(l2tp_context *ctx)
 
 void context_delete_tunnel(l2tp_context *ctx)
 {
+  // Take the interface down.
+  struct ifreq ifr;
+  memset(&ifr, 0, sizeof(ifr));
+  strncpy(ifr.ifr_name, ctx->tunnel_iface, sizeof(ifr.ifr_name));
+  if (ioctl(ctx->fd, SIOCGIFFLAGS, &ifr) == 0) {
+    ifr.ifr_flags &= ~IFF_UP;
+    if (ioctl(ctx->fd, SIOCSIFFLAGS, &ifr) < 0) {
+      syslog(LOG_WARNING, "Failed to take down interface %s (errno=%d).", ifr.ifr_name, errno);
+    }
+  }
+
   // Delete the session
   struct nl_msg *msg = nlmsg_alloc();
   genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, ctx->nl_family, 0, NLM_F_REQUEST,
@@ -737,6 +778,9 @@ int context_session_set_mtu(l2tp_context *ctx, uint16_t mtu)
 {
   // Update the device MTU
   struct ifreq ifr;
+
+  if (mtu < 1280)
+    mtu = 1280;
 
   memset(&ifr, 0, sizeof(ifr));
   strncpy(ifr.ifr_name, ctx->tunnel_iface, sizeof(ifr.ifr_name));
@@ -829,6 +873,14 @@ void context_process(l2tp_context *ctx)
           asyncns_freeaddrinfo(result);
           ctx->broker_resq = NULL;
         }
+      } else if (is_timeout(&ctx->timer_resolving, 5)) {
+        syslog(LOG_ERR, "Hostname resolution timed out.");
+
+        if (ctx->broker_resq)
+          asyncns_cancel(asyncns_context, ctx->broker_resq);
+        ctx->broker_resq = NULL;
+        ctx->state = STATE_REINIT;
+        return;
       }
       break;
     }
@@ -1022,8 +1074,15 @@ int main(int argc, char **argv)
           return 1;
         }
 
-        brokers[broker_cnt].address = strdup(strtok(optarg, ":"));
-        brokers[broker_cnt].port = strdup(strtok(NULL, ":"));
+        char *address = strtok(optarg, ":");
+        char *port = strtok(NULL, ":");
+        if (!address || !port) {
+          fprintf(stderr, "ERROR: Each broker must be passed in the format 'host:port'!\n");
+          return 1;
+        }
+
+        brokers[broker_cnt].address = strdup(address);
+        brokers[broker_cnt].port = strdup(port);
         brokers[broker_cnt].ctx = NULL;
         broker_cnt++;
         break;
@@ -1068,11 +1127,6 @@ int main(int argc, char **argv)
         tunnel_iface, hook, tunnel_id, limit_bandwidth_down);
 
       if (!brokers[i].ctx) {
-        if (++tries >= 120) {
-          syslog(LOG_ERR, "Unable to initialize tunneldigger context! Aborting.");
-          return 1;
-        }
-
         syslog(LOG_ERR, "Unable to initialize tunneldigger context! Retrying in 5 seconds...");
         sleep(5);
         continue;
