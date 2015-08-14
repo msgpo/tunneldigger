@@ -24,10 +24,9 @@ import datetime
 import fcntl
 import gevent
 import gevent.socket as gsocket
-# Import gevent.subprocess needs to be explicit
-import gevent.subprocess
 import genetlink
 import logging
+import logging.handlers
 import netfilter.rule
 import netfilter.table
 import netlink
@@ -38,6 +37,11 @@ import struct
 import sys
 import traceback
 import traffic_control
+
+try:
+  from gevent import subprocess as gevent_subprocess
+except ImportError:
+  import gevent_subprocess
 
 # Control message for our protocol; first few bits are special as we have to
 # maintain compatibility with LTPv3 in the kernel (first bit must be 1); also
@@ -55,7 +59,7 @@ ControlMessage = cs.Struct("control",
   # Message data (with length prefix)
   cs.PascalString("data"),
   # Pad the message so it is at least 12 bytes long
-  cs.Padding(lambda ctx: max(0, 6 - len(ctx["data"]))),
+  cs.Optional(cs.Padding(lambda ctx: max(0, 6 - len(ctx["data"])))),
 )
 
 # Unreliable messages (0x00 - 0x7F)
@@ -147,7 +151,7 @@ L2TP_ENCAPTYPE_UDP = 0
 L2TP_PWTYPE_ETH = 0x0005
 
 # Logger
-logger = None
+logger = logging.getLogger("tunneldigger.broker")
 
 # Check for required modules
 required_modules = ['nf_conntrack_netlink', 'nf_conntrack', 'nfnetlink', 'l2tp_netlink', 'l2tp_core']
@@ -386,6 +390,7 @@ class Tunnel(gevent.Greenlet):
     self.limits = Limits(self)
     self.sessions = {}
     self.next_session_id = 1
+    self.id = -1
     self.keep_alive()
 
   def setup(self):
@@ -440,10 +445,12 @@ class Tunnel(gevent.Greenlet):
 
       # Reset measured PMTU
       self.probed_pmtu = 0
+      self.num_pmtu_probes = 0
+      self.num_pmtu_replies = 0
 
       # Transmit PMTU probes of different sizes multiple times
       for _ in xrange(4):
-        for size in [500, 750, 1000, 1100, 1250, 1300, 1400, 1492, 1500]:
+        for size in [1334, 1400, 1450, 1476, 1492, 1500]:
           try:
             msg = ControlMessage.build(cs.Container(
               magic1 = 0x80,
@@ -456,22 +463,28 @@ class Tunnel(gevent.Greenlet):
             msg += '\x00' * (size - IPV4_HDR_OVERHEAD - L2TP_CONTROL_SIZE - 6)
 
             self.socket.send(msg)
+            self.num_pmtu_probes += 1
           except gsocket.error:
             pass
 
         gevent.sleep(1)
 
       # Collect all acknowledgements
-      gevent.sleep(1)
-      detected_pmtu = self.probed_pmtu - L2TP_TUN_OVERHEAD
-      if detected_pmtu > 0 and detected_pmtu != self.pmtu:
+      if self.num_pmtu_probes != self.num_pmtu_replies:
+        gevent.sleep(3)
+
+      detected_pmtu = max(self.probed_pmtu - L2TP_TUN_OVERHEAD, 1280)
+      if not self.probed_pmtu or not self.num_pmtu_replies:
+        logger.warning("Got no replies to any PMTU probes for tunnel %d." % self.id)
+        continue
+      elif detected_pmtu > 0 and detected_pmtu != self.pmtu:
         # Alter MTU for all sessions
         for session in self.sessions.values():
           self.manager.session_set_mtu(self, session, detected_pmtu)
 
           # Invoke MTU change hook for each session
           self.manager.hook('session.mtu-changed', self.id, session.id, session.name, self.pmtu,
-            detected_pmtu)
+            detected_pmtu, self.uuid)
 
         logger.debug("Detected PMTU of %d for tunnel %d." % (detected_pmtu, self.id))
         self.pmtu = detected_pmtu
@@ -528,6 +541,7 @@ class Tunnel(gevent.Greenlet):
       elif msg.type == CONTROL_TYPE_PMTUD_ACK:
         # Decode ACK packet and extract size
         psize = cs.UBInt16("size").parse(msg.data) + IPV4_HDR_OVERHEAD
+        self.num_pmtu_replies += 1
 
         if psize > self.probed_pmtu:
           self.probed_pmtu = psize
@@ -558,13 +572,13 @@ class Tunnel(gevent.Greenlet):
     for session in self.sessions.values():
       # Invoke any pre-down hooks
       self.manager.hook('session.pre-down', self.id, session.id, session.name, self.pmtu, self.endpoint[0],
-        self.endpoint[1], self.port)
+        self.endpoint[1], self.port, self.uuid)
 
       self.manager.netlink.session_delete(self.id, session.id)
 
       # Invoke any down hooks
       self.manager.hook('session.down', self.id, session.id, session.name, self.pmtu, self.endpoint[0],
-        self.endpoint[1], self.port)
+        self.endpoint[1], self.port, self.uuid)
 
     # Transmit error message so the other end can tear down the tunnel
     # immediately instead of waiting for keepalive timeout
@@ -612,7 +626,7 @@ class Tunnel(gevent.Greenlet):
     """
     for session in self.sessions.values():
       self.manager.hook('session.up', self.id, session.id, session.name, self.pmtu,
-        self.endpoint[0], self.endpoint[1], self.port)
+        self.endpoint[0], self.endpoint[1], self.port, self.uuid)
 
   def create_session(self):
     """
@@ -752,9 +766,17 @@ class TunnelManager(object):
       return
 
     # Execute the registered hook
-    logger.debug("Executing hook '%s' via script '%s'..." % (name, script))
+    logger.debug("Executing hook '%s' via script '%s %s'." % (name, script, str([str(x) for x in args])))
     try:
-      gevent.subprocess.call([script] + [str(x) for x in args])
+      script_process = gevent.subprocess.Popen([script] + [str(x) for x in args], stdout=gevent.subprocess.PIPE, stderr=gevent.subprocess.PIPE)
+      stdout, stderr = script_process.communicate()
+
+      if stdout:
+          logger.debug("script stdout:")
+          logger.debug(stdout)
+      if stderr:
+          logger.warning("script stderr:")
+          logger.warning(stderr)
     except:
       logger.debug(traceback.format_exc())
       logger.warning("Failed to execute hook '%s'!" % script)
@@ -900,6 +922,11 @@ class TunnelManager(object):
     :param session: Session instance
     :param mtu: Wanted MTU
     """
+
+    # Ignore tunnel setup if the manager is closing.
+    if self.closed:
+      return None, False
+
     try:
       ifreq = (session.name + '\0' * 16)[:16]
       data = struct.pack("16si", ifreq, mtu)
@@ -954,6 +981,11 @@ class TunnelManager(object):
       tunnel has just been created; (None, False) if something went
       wrong
     """
+
+    # Ignore tunnel setup if the manager is closing.
+    if self.closed:
+      return None, False
+
     if endpoint in self.tunnels:
       tunnel = self.tunnels[endpoint]
 
@@ -1052,6 +1084,11 @@ class MessageHandler(object):
     :return: Message if the message needs further processing, None
       otherwise
     """
+
+    # Ignore the message if the manager is closing.
+    if self.manager.closed:
+      return
+
     try:
       msg = ControlMessage.parse(data)
     except cs.ConstructError:
@@ -1131,6 +1168,19 @@ class BaseControl(gevent.Greenlet):
 
       self.handler.handle(socket, data, address)
 
+def setup_logging(config):
+    filename = config.get("log", "filename")
+    level = getattr(logging, config.get("log", "verbosity"))
+    lineformat = '%(asctime)s %(levelname)-8s %(message)s'
+    dateformat = '%a, %d %b %Y %H:%M:%S'
+
+    handler = logging.handlers.WatchedFileHandler(filename)
+    handler.setFormatter(logging.Formatter(lineformat, dateformat))
+    handler.addFilter(logging.Filter('tunneldigger'))
+
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
 if __name__ == '__main__':
   try:
     # We must run as root
@@ -1155,16 +1205,7 @@ if __name__ == '__main__':
       print "ERROR: First argument must be a configuration file path!"
       sys.exit(1)
 
-    # Setup the logger
-    logging.basicConfig(
-      level = getattr(logging, config.get("log", "verbosity")),
-      format = '%(asctime)s %(levelname)-8s %(message)s',
-      datefmt = '%a, %d %b %Y %H:%M:%S',
-      filename = config.get("log", "filename"),
-      filemode = 'a'
-    )
-    logging.root.handlers[0].addFilter(logging.Filter('tunneldigger'))
-    logger = logging.getLogger("tunneldigger.broker")
+    setup_logging(config)
 
     # Setup the base control server
     manager = TunnelManager(config)
