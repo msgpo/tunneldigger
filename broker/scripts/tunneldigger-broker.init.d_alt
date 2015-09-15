@@ -1,0 +1,79 @@
+#! /bin/sh                                                                      
+### BEGIN INIT INFO                                                             
+# Provides:          tunneldigger                                               
+# Required-Start:    networking                                                 
+# Required-Stop:     networking                                                 
+# Default-Start:     2 3 4 5                                                    
+# Default-Stop:      0 1 6                                                      
+# Short-Description: Start the tunneldigger broker.                             
+# Description:                                                                  
+### END INIT INFO                                                               
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+. /lib/lsb/init-functions
+
+BROKER_DIR=/opt/tunneldigger/broker
+
+BROKER_BIN="${BROKER_DIR}/l2tp_broker.py"
+BROKER_CFG="${BROKER_DIR}/l2tp_broker.cfg"
+BROKER_LOG="${BROKER_DIR}/stderr.log"
+BROKER_PID="/var/run/l2tp_broker.pid"
+
+do_start() {
+    if [ -f ${BROKER_PID} ]; then
+        echo "tunneldigger broker already running"
+    else
+        echo "Starting tunneldigger broker"
+	nohup $BROKER_BIN $BROKER_CFG 2> $BROKER_LOG > /dev/null &
+        echo $! > $BROKER_PID
+    fi
+}
+
+do_stop() {
+    if [ -f ${BROKER_PID} ]; then
+        echo "Stopping tunneldigger broker"
+	kill `cat ${BROKER_PID}`
+        rm $BROKER_PID
+    else
+        echo "tunneldigger broker not running"
+    fi
+}
+
+do_restart() {
+    if [ -f ${BROKER_PID} ]; then
+        do_stop
+        do_start
+    else
+        echo "tunneldigger broker not running"
+    fi
+}
+
+do_status() {
+    if [ -f ${BROKER_PID} ]; then
+        echo "tunneldigger broker running with pid `cat ${BROKER_PID}`"
+    else
+        echo "tunneldigger broker not running"
+    fi
+}
+
+case "$1" in
+  start)
+        do_start
+        ;;
+  restart)
+        do_restart
+        ;;
+  status)
+
+        ;;
+  stop)
+        do_stop
+        ;;
+  *)
+        echo "Usage: $0 start|stop|restart|status" >&2
+        exit 3
+        ;;
+esac
+
+:

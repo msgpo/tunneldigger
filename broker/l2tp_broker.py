@@ -700,8 +700,8 @@ class Tunnel(gevent.Greenlet):
 
     try:
       nat = netfilter.table.Table('nat')
-      nat.append_rule('L2TP_PREROUTING_%s' % self.manager.namespace, self.prerouting_rule)
-      nat.append_rule('L2TP_POSTROUTING_%s' % self.manager.namespace, self.postrouting_rule)
+      nat.prepend_rule('L2TP_PREROUTING_%s' % self.manager.namespace, self.prerouting_rule)
+      nat.prepend_rule('L2TP_POSTROUTING_%s' % self.manager.namespace, self.postrouting_rule)
     except netfilter.table.IptablesError:
       raise TunnelSetupFailed
 
@@ -802,6 +802,7 @@ class TunnelManager(object):
           logger.warning("script stderr:")
           logger.warning(stderr)
     except:
+      logger.debug(traceback.format_exc())
       logger.warning("Failed to execute hook '%s'!" % script)
       logger.warning(traceback.format_exc())
 
@@ -826,9 +827,12 @@ class TunnelManager(object):
     """
     prerouting_chain = "L2TP_PREROUTING_%s" % self.namespace
     postrouting_chain = "L2TP_POSTROUTING_%s" % self.namespace
+    after_postrouting_chain = "AFTER_L2TP_POST_%s" % self.namespace # juul
+
     nat = netfilter.table.Table('nat')
     self.rule_prerouting_jmp = netfilter.rule.Rule(jump = prerouting_chain)
     self.rule_postrouting_jmp = netfilter.rule.Rule(jump = postrouting_chain)
+    self.rule_after_postrouting_jmp = netfilter.rule.Rule(jump = after_postrouting_chain)
 
     try:
       nat.flush_chain(prerouting_chain)
@@ -854,7 +858,15 @@ class TunnelManager(object):
       nat.delete_rule('POSTROUTING', self.rule_postrouting_jmp)
     except netfilter.table.IptablesError:
       pass
-    nat.prepend_rule('POSTROUTING', self.rule_postrouting_jmp)
+
+    nat.append_rule('POSTROUTING', self.rule_postrouting_jmp)
+
+    # juul
+    # after the L2TP_POSTROUTING chain, jump to another chain
+    if not after_postrouting_chain in nat.list_chains():
+      nat.create_chain(after_postrouting_chain)
+
+    nat.append_rule(postrouting_chain, self.rule_after_postrouting_jmp)
 
     # Clear out the connection tracking tables
     self.conntrack.killall(proto = conntrack.IPPROTO_UDP, src = self.address)
@@ -867,6 +879,7 @@ class TunnelManager(object):
     nat = netfilter.table.Table('nat')
     nat.delete_rule('PREROUTING', self.rule_prerouting_jmp)
     nat.delete_rule('POSTROUTING', self.rule_postrouting_jmp)
+    nat.delete_rule('L2TP_POSTROUTING_%s' % self.namespace, self.rule_after_postrouting_jmp) # juul
     nat.delete_chain('L2TP_PREROUTING_%s' % self.namespace)
     nat.delete_chain('L2TP_POSTROUTING_%s' % self.namespace)
 
