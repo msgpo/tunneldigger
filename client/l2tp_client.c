@@ -91,6 +91,7 @@ enum l2tp_ctrl_type {
   CONTROL_TYPE_PMTUD     = 0x06,
   CONTROL_TYPE_PMTUD_ACK = 0x07,
   CONTROL_TYPE_REL_ACK   = 0x08,
+  CONTROL_TYPE_PMTU_NTFY = 0x09,
 
   // Reliable messages (0x80 - 0xFF)
   CONTROL_TYPE_LIMIT     = 0x80,
@@ -150,6 +151,9 @@ typedef struct {
   // List of unacked reliable messages
   reliable_message *reliable_unacked;
 
+  /* Force the tunnel to go over a certain interface */
+  char *force_iface;
+
   // Limits
   uint32_t limit_bandwidth_down;
 
@@ -162,6 +166,7 @@ typedef struct {
 
   // PMTU probing
   int pmtu;
+  int peer_pmtu;
   int probed_pmtu;
   time_t pmtu_reprobe_interval;
   time_t timer_pmtu_reprobe;
@@ -180,6 +185,7 @@ typedef struct {
 // Forward declarations
 void context_delete_tunnel(l2tp_context *ctx);
 void context_close_tunnel(l2tp_context *ctx);
+int context_session_set_mtu(l2tp_context *ctx);
 void context_send_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t len);
 void context_send_raw_packet(l2tp_context *ctx, char *packet, uint8_t len);
 void context_send_reliable_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t len);
@@ -260,7 +266,7 @@ void put_u32(unsigned char **buffer, uint32_t value)
 }
 
 l2tp_context *context_new(char *uuid, const char *local_ip, const char *broker_hostname,
-  char *broker_port, char *tunnel_iface, char *hook, int tunnel_id, int limit_bandwidth_down)
+  char *broker_port, char *tunnel_iface, char *force_iface, char *hook, int tunnel_id, int limit_bandwidth_down)
 {
   l2tp_context *ctx = (l2tp_context*) calloc(1, sizeof(l2tp_context));
   if (!ctx) {
@@ -284,6 +290,8 @@ l2tp_context *context_new(char *uuid, const char *local_ip, const char *broker_h
   ctx->tunnel_iface = strdup(tunnel_iface);
   ctx->tunnel_id = tunnel_id;
   ctx->hook = hook ? strdup(hook) : NULL;
+
+  ctx->force_iface = force_iface ? strdup(force_iface) : NULL;
 
   // Reset limits
   ctx->limit_bandwidth_down = (uint32_t) limit_bandwidth_down;
@@ -326,10 +334,10 @@ int context_reinitialize(l2tp_context *ctx)
     return -1;
 
   /* Bind the socket to an interface if given */
-  if (force_iface) {
+  if (ctx->force_iface) {
     int rc;
 
-    rc = setsockopt(ctx->fd, SOL_SOCKET, SO_BINDTODEVICE, force_iface, strlen(force_iface));
+    rc = setsockopt(ctx->fd, SOL_SOCKET, SO_BINDTODEVICE, ctx->force_iface, strlen(ctx->force_iface));
     if (rc != 0) {
       syslog(LOG_ERR, "Failed to bind to device!");
       return -1;
@@ -368,6 +376,7 @@ int context_reinitialize(l2tp_context *ctx)
 
   // PMTU discovery
   ctx->pmtu = 0;
+  ctx->peer_pmtu = 0;
   ctx->probed_pmtu = 0;
   ctx->pmtu_reprobe_interval = 15;
   ctx->timer_pmtu_reprobe = now;
@@ -523,6 +532,17 @@ void context_process_control_packet(l2tp_context *ctx)
       }
       break;
     }
+    case CONTROL_TYPE_PMTU_NTFY: {
+      if (ctx->state == STATE_KEEPALIVE) {
+        // Process a peer PMTU notification message
+        uint16_t pmtu = parse_u16(&buf);
+        if (pmtu != ctx->peer_pmtu) {
+          ctx->peer_pmtu = pmtu;
+          context_session_set_mtu(ctx);
+        }
+      }
+      break;
+    }
     case CONTROL_TYPE_REL_ACK: {
       // ACK of a reliable message
       uint16_t seqno = parse_u16(&buf);
@@ -642,7 +662,7 @@ void context_send_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t
 
 void context_send_pmtu_probe(l2tp_context *ctx, size_t size)
 {
-  char buffer[2048];
+  char buffer[2048] = {0,};
   if (size > 1500 || size < L2TP_CONTROL_SIZE)
     return;
 
@@ -655,7 +675,18 @@ void context_send_pmtu_probe(l2tp_context *ctx, size_t size)
 
   // Send the packet
   if (send(ctx->fd, &buffer, size - IPV4_HDR_OVERHEAD, 0) < 0) {
-    syslog(LOG_WARNING, "Failed to send() PMTU probe packet (errno=%d)!", errno);
+    switch (errno) {
+      // Sometimes EAFNOSUPPORT is emitted for messages larger than the local MTU in case of PPPoE.
+      case EAFNOSUPPORT:
+      case EMSGSIZE: {
+        // Message is larger than the local MTU. This is expected.
+        break;
+      }
+      default: {
+        syslog(LOG_WARNING, "Failed to send() PMTU probe packet of size %lu (errno=%d)!", size, errno);
+        break;
+      }
+    }
   }
 }
 
@@ -774,8 +805,12 @@ int context_setup_tunnel(l2tp_context *ctx, uint32_t peer_tunnel_id)
   return 0;
 }
 
-int context_session_set_mtu(l2tp_context *ctx, uint16_t mtu)
+int context_session_set_mtu(l2tp_context *ctx)
 {
+  uint16_t mtu = ctx->pmtu - L2TP_TUN_OVERHEAD;
+  if (ctx->peer_pmtu > 0 && ctx->peer_pmtu < mtu)
+    mtu = ctx->peer_pmtu;
+
   // Update the device MTU
   struct ifreq ifr;
 
@@ -916,8 +951,14 @@ void context_process(l2tp_context *ctx)
       if (is_timeout(&ctx->timer_pmtu_collect, 5)) {
         if (ctx->probed_pmtu > 0 && ctx->probed_pmtu != ctx->pmtu) {
           ctx->pmtu = ctx->probed_pmtu;
-          context_session_set_mtu(ctx, ctx->pmtu - L2TP_TUN_OVERHEAD);
+          context_session_set_mtu(ctx);
         }
+
+        // Notify the broker of the configured MTU
+        char buffer[16];
+        unsigned char *buf = (unsigned char*) &buffer;
+        put_u16(&buf, ctx->pmtu - L2TP_TUN_OVERHEAD);
+        context_send_packet(ctx, CONTROL_TYPE_PMTU_NTFY, (char*) &buffer, 2);
 
         ctx->probed_pmtu = 0;
         ctx->timer_pmtu_collect = -1;
@@ -984,6 +1025,7 @@ void context_free(l2tp_context *ctx)
   free(ctx->hook);
   free(ctx->broker_hostname);
   free(ctx->broker_port);
+  free(ctx->force_iface);
   free(ctx);
 }
 
@@ -1042,7 +1084,7 @@ int main(int argc, char **argv)
 
   // Parse program options
   int log_option = 0;
-  char *uuid = NULL, *local_ip = "0.0.0.0", *tunnel_iface = NULL;
+  char *uuid = NULL, *local_ip = "0.0.0.0", *tunnel_iface = NULL, *force_iface_opt = NULL;
   char *hook = NULL;
   int tunnel_id = 1;
   int limit_bandwidth_down = 0;
@@ -1091,7 +1133,7 @@ int main(int argc, char **argv)
       case 's': hook = strdup(optarg); break;
       case 't': tunnel_id = atoi(optarg); break;
       case 'L': limit_bandwidth_down = atoi(optarg); break;
-      case 'I': force_iface = strdup(optarg); break;
+      case 'I': force_iface_opt = strdup(optarg); break;
       default: {
         fprintf(stderr, "ERROR: Invalid option %c!\n", c);
         show_help(argv[0]);
@@ -1124,7 +1166,7 @@ int main(int argc, char **argv)
     int tries = 0;
     for (;;) {
       brokers[i].ctx = context_new(uuid, local_ip, brokers[i].address, brokers[i].port,
-        tunnel_iface, hook, tunnel_id, limit_bandwidth_down);
+        tunnel_iface, force_iface_opt, hook, tunnel_id, limit_bandwidth_down);
 
       if (!brokers[i].ctx) {
         syslog(LOG_ERR, "Unable to initialize tunneldigger context! Retrying in 5 seconds...");
