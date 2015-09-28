@@ -3,9 +3,12 @@ Tunneldigger
 
 Tunneldigger is one of the projects of `wlan slovenija`_ open wireless network.
 It is a simple VPN tunneling solution based on L2TPv3 tunnels supported in
-recent Linux kernels.
+recent Linux kernels. This is the `sudomesh`_ repo, where we occasionally make
+development changes appropriate to our project. For the most part, we are
+making sure this repo stays up to date with upstream changes. 
 
 .. _wlan slovenija: https://wlan-si.net
+.. _sudomesh: https://sudomesh.org/
 
 Documentation is found at:
 
@@ -27,6 +30,23 @@ or sudo mesh wiki and development list:
 .. _sudo mesh wiki: https://sudoroom.org/wiki/Mesh
 .. _sudo mesh mailing list: http://lists.sudoroom.org/listinfo/mesh
 
-*If you're confused about why you can't pull a fresh version of the sudomesh fork, it's because I (maxb) 
-re-wrote a bunch of history on the master branch. I apologize and it's pretty much entirely my fault, but 
-it was inevitable. Go ahead and pull a clean version of this repo and it let's all cross our fingers it works!*
+
+Branching Info (for sudomesh fork):
+~~~~~~~~~~~~~~~~~~~~~~
+- upstream is for tracking wlanslovenija/tunneldigger. The only necessary work to be 
+  done on this branch is to rebase from wlanslovenija/tunneldigger/master
+
+- pull_request is for work that we'd like wlanslovenija/tunneldigger to incorporate into
+  their repo. It's important to make sure that this branch mirrors wlanslovenija/tunneldigger/master
+  except for the specific commits we'd like to be pulled in.
+  If we have multiple pull requests, we can use something like pull_requests/feature_name, etc.
+
+- master is for our code. Generally to keep this up to date we'll occasionally need to merge upstream into it.
+  Remember that we want to avoid diverging from wlanslovenija/tunneldigger/master as much as possible,
+  so for any code that isn't specific to sudomesh (and there shouldn't be much aside from perhaps this README),
+  create a pull request with the specific commits.
+
+
+
+*We've had to re-write history in this repo on a couple of occasions recently. 
+PLEASE MAKE SURE YOU ARE WORKING WITH A FRESH CLONE*
