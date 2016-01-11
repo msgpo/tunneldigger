@@ -50,3 +50,21 @@ Branching Info (for sudomesh fork):
 
 *We've had to re-write history in this repo on a couple of occasions recently. 
 PLEASE MAKE SURE YOU ARE WORKING WITH A FRESH CLONE*
+Contributors
+------------
+
+* `@kostko`_
+* `@lynxis`_
+* `@mitar`_
+* `@max-b`_
+* `@mehlix`_
+* `@valentt`_
+* `@papazoga`_
+
+.. _@kostko: https://github.com/kostko
+.. _@lynxis: https://github.com/lynxis
+.. _@mitar: https://github.com/mitar
+.. _@max-b: https://github.com/max-b
+.. _@mehlix: https://github.com/mehlis
+.. _@valentt: https://github.com/valentt
+.. _@papazoga: https://github.com/papazoga

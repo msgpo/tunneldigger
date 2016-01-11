@@ -3,4 +3,6 @@
 *.o
 l2tp_client
 *.sublime-*
+*.cfg
 /docs/_build
+/tests/test-data

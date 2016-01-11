@@ -97,6 +97,18 @@ enum l2tp_ctrl_type {
   CONTROL_TYPE_LIMIT     = 0x80,
 };
 
+enum l2tp_error_type {
+  ERROR_REASON_OTHER_REQUEST  = 0x00,
+  ERROR_REASON_SHUTDOWN       = 0x01,
+  ERROR_REASON_TIMEOUT        = 0x02,
+  ERROR_REASON_FAILURE        = 0x03,
+};
+
+enum l2tp_error_direction {
+  ERROR_DIRECTION_SERVER = 0x00,
+  ERROR_DIRECTION_CLIENT = 0x10,
+};
+
 enum l2tp_limit_type {
   LIMIT_TYPE_BANDWIDTH_DOWN = 0x01
 };
@@ -148,6 +160,10 @@ typedef struct {
   int nl_family;
   // Sequence number for reliable messages
   uint16_t reliable_seqno;
+
+  // Sequence number for keep alive
+  uint32_t keepalive_seqno;
+
   // List of unacked reliable messages
   reliable_message *reliable_unacked;
 
@@ -184,7 +200,7 @@ typedef struct {
 
 // Forward declarations
 void context_delete_tunnel(l2tp_context *ctx);
-void context_close_tunnel(l2tp_context *ctx);
+void context_close_tunnel(l2tp_context *ctx, uint8_t reason);
 int context_session_set_mtu(l2tp_context *ctx);
 void context_send_packet(l2tp_context *ctx, uint8_t type, char *payload, uint8_t len);
 void context_send_raw_packet(l2tp_context *ctx, char *packet, uint8_t len);
@@ -278,7 +294,7 @@ l2tp_context *context_new(char *uuid, const char *local_ip, const char *broker_h
 
   ctx->local_endpoint.sin_family = AF_INET;
   ctx->local_endpoint.sin_port = 0;
-  if (inet_aton(local_ip, &ctx->local_endpoint.sin_addr.s_addr) < 0) {
+  if (inet_aton(local_ip, &ctx->local_endpoint.sin_addr) < 0) {
     syslog(LOG_ERR, "Failed to parse local endpoint!");
     goto free_and_return;
   }
@@ -355,6 +371,7 @@ int context_reinitialize(l2tp_context *ctx)
 
   ctx->standby_only = 1;
   ctx->standby_available = 0;
+  ctx->keepalive_seqno = 0;
   ctx->reliable_seqno = 0;
   while (ctx->reliable_unacked != NULL) {
     reliable_message *next = ctx->reliable_unacked->next;
@@ -453,7 +470,8 @@ void context_process_control_packet(l2tp_context *ctx)
   ssize_t bytes = recvfrom(ctx->fd, &buffer, sizeof(buffer), 0, (struct sockaddr*) &endpoint,
     &endpoint_len);
 
-  if (bytes < 0)
+  /* a valid package must at least 6 byte long */
+  if (bytes < 6)
     return;
 
   // Decode packet header
@@ -467,6 +485,10 @@ void context_process_control_packet(l2tp_context *ctx)
 
   uint8_t type = parse_u8(&buf);
   uint8_t payload_length = parse_u8(&buf);
+  uint8_t error_code = 0;
+
+  if (payload_length > (bytes - 6))
+    return;
 
   // Each received packet counts as a liveness indicator
   ctx->last_alive = timer_now();
@@ -475,7 +497,10 @@ void context_process_control_packet(l2tp_context *ctx)
   switch (type) {
     case CONTROL_TYPE_COOKIE: {
       if (ctx->state == STATE_GET_COOKIE) {
-        memcpy(&ctx->cookie, buf, payload_length);
+        if (payload_length != 8)
+          break;
+
+        memcpy(&ctx->cookie, buf, 8);
 
         // Mark the connection as being available for later establishment
         ctx->standby_available = 1;
@@ -488,17 +513,29 @@ void context_process_control_packet(l2tp_context *ctx)
       break;
     }
     case CONTROL_TYPE_ERROR: {
+      if (payload_length > 0) {
+        error_code = parse_u8(&buf);
+      }
       if (ctx->state == STATE_GET_TUNNEL) {
-        syslog(LOG_WARNING, "Received error response from broker!");
+        if (payload_length > 0)
+          syslog(LOG_WARNING, "Received error response from broker with errorcode %d!", error_code);
+        else
+          syslog(LOG_WARNING, "Received error response from broker!");
         ctx->state = STATE_GET_COOKIE;
       } else if (ctx->state == STATE_KEEPALIVE) {
-        syslog(LOG_ERR, "Broker sent us a teardown request, closing tunnel!");
-        context_close_tunnel(ctx);
+        if (payload_length > 0)
+          syslog(LOG_ERR, "Broker sent us a teardown request, closing tunnel with errorcode %d!", error_code);
+        else
+          syslog(LOG_ERR, "Broker sent us a teardown request, closing tunnel!");
+        context_close_tunnel(ctx, ERROR_REASON_OTHER_REQUEST);
       }
       break;
     }
     case CONTROL_TYPE_TUNNEL: {
       if (ctx->state == STATE_GET_TUNNEL) {
+        if (payload_length != 4)
+          break;
+
         if (context_setup_tunnel(ctx, parse_u32(&buf)) < 0) {
           syslog(LOG_ERR, "Unable to create local L2TP tunnel!");
           ctx->state = STATE_GET_COOKIE;
@@ -525,6 +562,8 @@ void context_process_control_packet(l2tp_context *ctx)
     }
     case CONTROL_TYPE_PMTUD_ACK: {
       if (ctx->state == STATE_KEEPALIVE) {
+        if (payload_length != 2)
+          break;
         // Process a PMTU probe
         uint16_t psize = parse_u16(&buf) + IPV4_HDR_OVERHEAD;
         if (psize > ctx->probed_pmtu)
@@ -534,6 +573,9 @@ void context_process_control_packet(l2tp_context *ctx)
     }
     case CONTROL_TYPE_PMTU_NTFY: {
       if (ctx->state == STATE_KEEPALIVE) {
+        if (payload_length != 2)
+          break;
+
         // Process a peer PMTU notification message
         uint16_t pmtu = parse_u16(&buf);
         if (pmtu != ctx->peer_pmtu) {
@@ -544,6 +586,9 @@ void context_process_control_packet(l2tp_context *ctx)
       break;
     }
     case CONTROL_TYPE_REL_ACK: {
+      if (payload_length != 2)
+        break;
+
       // ACK of a reliable message
       uint16_t seqno = parse_u16(&buf);
       reliable_message *msg = ctx->reliable_unacked;
@@ -842,10 +887,12 @@ int context_session_set_mtu(l2tp_context *ctx)
   return 0;
 }
 
-void context_close_tunnel(l2tp_context *ctx)
+void context_close_tunnel(l2tp_context *ctx, uint8_t reason)
 {
+  reason |= ERROR_DIRECTION_CLIENT;
+
   // Notify the broker that the tunnel has been closed
-  context_send_packet(ctx, CONTROL_TYPE_ERROR, NULL, 0);
+  context_send_packet(ctx, CONTROL_TYPE_ERROR, &reason, 1);
 
   // Call down hook, delete the tunnel and set state to reinit
   context_call_hook(ctx, "session.down");
@@ -932,9 +979,17 @@ void context_process(l2tp_context *ctx)
       break;
     }
     case STATE_KEEPALIVE: {
-      // Send periodic keepalive messages
-      if (is_timeout(&ctx->timer_keepalive, 5))
-        context_send_packet(ctx, CONTROL_TYPE_KEEPALIVE, NULL, 0);
+      /* Send periodic keepalive messages
+       * The sequence number is needed because some ISP (usually cable or mobile operators)
+       * do some "optimisation" and drop udp packets containing the same content.
+       */
+      if (is_timeout(&ctx->timer_keepalive, 5)) {
+        char buffer[4];
+        unsigned char *buf = (unsigned char*) &buffer;
+        put_u32(&buf, ctx->keepalive_seqno);
+        context_send_packet(ctx, CONTROL_TYPE_KEEPALIVE, buffer, 4);
+        ctx->keepalive_seqno++;
+      }
 
       // Send periodic PMTU probes
       if (is_timeout(&ctx->timer_pmtu_reprobe, ctx->pmtu_reprobe_interval)) {
@@ -996,7 +1051,7 @@ void context_process(l2tp_context *ctx)
       // Check if the tunnel is still alive
       if (timer_now() - ctx->last_alive > 60) {
         syslog(LOG_WARNING, "Tunnel has timed out, closing down interface.");
-        context_close_tunnel(ctx);
+        context_close_tunnel(ctx, ERROR_REASON_TIMEOUT);
       }
       break;
     }
@@ -1012,6 +1067,18 @@ void context_process(l2tp_context *ctx)
       break;
     }
   }
+}
+
+void cleanup()
+{
+  if (main_context) {
+    context_close_tunnel(main_context, ERROR_REASON_SHUTDOWN);
+    context_free(main_context);
+    main_context = NULL;
+  }
+
+  if (asyncns_context)
+    asyncns_free(asyncns_context);
 }
 
 void context_free(l2tp_context *ctx)
@@ -1035,11 +1102,7 @@ void term_handler(int signum)
 
   syslog(LOG_WARNING, "Got termination signal, shutting down tunnel...");
 
-  if (main_context) {
-    context_close_tunnel(main_context);
-    main_context = NULL;
-  }
-
+  cleanup();
   exit(1);
 }
 
@@ -1100,8 +1163,8 @@ int main(int argc, char **argv)
   broker_cfg brokers[MAX_BROKERS];
   int broker_cnt = 0;
 
-  char c;
-  while ((c = getopt(argc, argv, "hfu:l:b:p:i:s:t:L:I:")) != EOF) {
+  int c;
+  while ((c = getopt(argc, argv, "hfu:l:b:p:i:s:t:L:I:")) != -1) {
     switch (c) {
       case 'h': {
         show_help(argv[0]);
@@ -1116,15 +1179,14 @@ int main(int argc, char **argv)
           return 1;
         }
 
-        char *address = strtok(optarg, ":");
-        char *port = strtok(NULL, ":");
-        if (!address || !port) {
+        char *pos = strchr(optarg, ':');
+        if (!pos) {
           fprintf(stderr, "ERROR: Each broker must be passed in the format 'host:port'!\n");
           return 1;
         }
 
-        brokers[broker_cnt].address = strdup(address);
-        brokers[broker_cnt].port = strdup(port);
+        brokers[broker_cnt].address = strndup(optarg, pos - optarg);
+        brokers[broker_cnt].port = strdup(pos + 1);
         brokers[broker_cnt].ctx = NULL;
         broker_cnt++;
         break;
@@ -1207,17 +1269,24 @@ int main(int argc, char **argv)
         ready_cnt += brokers[i].ctx->standby_available ? 1 : 0;
       }
 
-      if (ready_cnt == broker_cnt || (is_timeout(&timer_collect, 20) && ready_cnt > 0))
+      if (ready_cnt == broker_cnt || is_timeout(&timer_collect, 20))
         break;
     }
 
     // Select the first available broker and use it to establish a tunnel
+    main_context = NULL;
     for (i = 0; i < broker_cnt; i++) {
       if (brokers[i].ctx->standby_available) {
         brokers[i].ctx->standby_only = 0;
         main_context = brokers[i].ctx;
         break;
       }
+    }
+
+    // If no broker has been selected, restart broker selection
+    if (!main_context) {
+      syslog(LOG_ERR, "No suitable brokers found.");
+      continue;
     }
 
     syslog(LOG_INFO, "Selected %s:%s as the best broker.", brokers[i].address,
@@ -1258,8 +1327,7 @@ int main(int argc, char **argv)
     main_context = NULL;
   }
 
-  if (asyncns_context)
-    asyncns_free(asyncns_context);
+  cleanup();
 
   return 0;
 }
