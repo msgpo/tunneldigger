@@ -14,12 +14,7 @@ Documentation is found at:
 
 http://tunneldigger.readthedocs.org/
 
-One very important thing missing from the documentation is how to actually start the broker. After activating the virtualenv do:
-
-```
-cd tunneldigger/
-python -m broker.main broker/l2tp_broker.cfg
-```
+and in `sudomesh/README.md`
 
 For development *wlan slovenija* open wireless network `development Trac`_ is
 used, so you can see `existing open tickets`_ or `open a new one`_ there. Source
