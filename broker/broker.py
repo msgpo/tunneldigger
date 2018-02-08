@@ -4,6 +4,7 @@ import netfilter.rule
 import logging
 import time
 import traceback
+import re
 
 from . import l2tp, protocol, network, tunnel as td_tunnel
 
@@ -221,4 +222,5 @@ class Broker(protocol.HandshakeProtocolMixin, network.Pollable):
         :return: True if a tunnel has been created, False otherwise
         """
 
-        return self.tunnel_manager.create_tunnel(self, address, uuid, remote_tunnel_id)
+	uuid_clean = re.sub("[^a-zA-Z0-9\-]","",uuid)
+        return self.tunnel_manager.create_tunnel(self, address, uuid_clean, remote_tunnel_id)
