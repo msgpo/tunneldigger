@@ -1,3 +1,10 @@
+
+NOTICE
+===========
+Note that as of 19 March 2018, we are transitioning to a newer version of tunneldigger broker/client.
+
+At time of writing, https://github.com/wlanslovenija/tunneldigger/commits/210037aabf8538a0a272661e08ea142784b42b2c is used on the (new) exit node (broker, see https://github.com/sudomesh/exitnode for scripts to setup your own) and firmware builds (client) at https://github.com/sudomesh/sudowrt-firmware/releases .
+
 Tunneldigger
 ============
 
